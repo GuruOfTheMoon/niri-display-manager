@@ -1,0 +1,1057 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# TUI Display Manager (Mirror / Extend / Arrange)
+# Target: CachyOS / Arch Linux (Wayland / Niri)
+# ==============================================================================
+
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# Colors & Styling
+# ------------------------------------------------------------------------------
+BORDER_COLOR="#7aa2f7"
+HEADER_COLOR="#bb9af7"
+DANGER_COLOR="#f7768e"
+SUCCESS_COLOR="#9ece6a"
+
+# Navigation Binds:
+# - Menus: W/S, K/J, and Arrows navigate directly
+# - Search Lists: Ctrl+W / Ctrl+S navigate; W/S type into the search query
+MENU_NAV_BINDS="w:up,s:down"
+SEARCH_NAV_BINDS="ctrl-w:up,ctrl-s:down"
+
+# One mirror at a time. State lives in the runtime dir, so it is cleared on logout.
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+MIRROR_STATE="$RUNTIME_DIR/display-manager-mirror.state"
+
+banner() {
+  clear
+  gum style \
+    --foreground "$BORDER_COLOR" \
+    --border-foreground "$BORDER_COLOR" \
+    --border double \
+    --align center \
+    --width 54 \
+    --margin "1 0" \
+    --padding "0 1" \
+    "󰍹  DISPLAY MANAGER" "Mirror • Extend • Arrange"
+}
+
+require_commands() {
+  local missing=()
+  local cmd
+  for cmd in niri gum fzf jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+      missing+=("$cmd")
+    fi
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    clear
+    gum style --foreground "$DANGER_COLOR" --bold "✖ Missing dependencies: ${missing[*]}"
+    gum style "Install them first, then run this menu again."
+    read -n 1 -s -r -p "Press any key to continue..."
+    exit 1
+  fi
+
+  if ! niri msg version &>/dev/null; then
+    clear
+    gum style --foreground "$DANGER_COLOR" --bold "✖ Cannot reach the running niri instance."
+    gum style "Make sure NIRI_SOCKET is available in this terminal."
+    read -n 1 -s -r -p "Press any key to continue..."
+    exit 1
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Shared TUI Helpers
+# ------------------------------------------------------------------------------
+# Every list item is "key<TAB>label". fzf only shows the label, but returns both.
+menu_select() {
+  local prompt="$1"
+  local header="$2"
+  local height="${3:-55%}"
+  local bindings="${4:-$MENU_NAV_BINDS}"
+
+  fzf \
+    --prompt="$prompt" \
+    --header="$header" \
+    --bind="$bindings" \
+    --delimiter=$'\t' \
+    --with-nth=2.. \
+    --color="border:$BORDER_COLOR,header:$HEADER_COLOR,prompt:#7dcfff,pointer:#f7768e" \
+    --height="$height" \
+    --border="rounded"
+}
+
+success_box() {
+  focus_menu_window
+  clear
+  gum style \
+    --foreground "$SUCCESS_COLOR" \
+    --border normal \
+    --border-foreground "$SUCCESS_COLOR" \
+    --padding "1 2" \
+    "$@"
+  read -n 1 -s -r -p "Press any key to continue..."
+}
+
+error_box() {
+  focus_menu_window
+  clear
+  gum style \
+    --foreground "$DANGER_COLOR" \
+    --border normal \
+    --border-foreground "$DANGER_COLOR" \
+    --padding "1 2" \
+    "$@"
+  read -n 1 -s -r -p "Press any key to continue..."
+}
+
+# ------------------------------------------------------------------------------
+# Niri Output Helpers
+# ------------------------------------------------------------------------------
+list_all_outputs() {
+  niri msg --json outputs | jq -r 'keys[]'
+}
+
+list_external_outputs() {
+  niri msg --json outputs | jq -r 'keys[] | select(test("^(HDMI|DP)-"))'
+}
+
+output_enabled() {
+  niri msg --json outputs \
+    | jq -r --arg n "$1" '.[$n].logical != null' 2>/dev/null \
+    || echo "false"
+}
+
+output_rect() {
+  niri msg --json outputs | jq -r --arg n "$1" '.[$n].logical | "\(.x) \(.y) \(.width) \(.height)"'
+}
+
+output_label() {
+  local name="$1"
+  niri msg --json outputs | jq -r --arg n "$name" '
+    .[$n] as $o
+    | ([$o.make, $o.model] | map(select(. != null and . != "")) | join(" ")) as $model
+    | ($o.logical // null) as $l
+    | if $l == null then
+        "󰍹  \($n)  │  \($model)  │  off"
+      else
+        (if $o.current_mode != null then $o.modes[$o.current_mode] else null end) as $m
+        | "󰍹  \($n)  │  \($model)  │  \($l.width)x\($l.height)\(if $m != null then " @ \((($m.refresh_rate / 1000) | round)) Hz" else "" end)  │  \($l.x),\($l.y)"
+      end
+  '
+}
+
+output_summary() {
+  local name="$1"
+  niri msg --json outputs | jq -r --arg n "$name" '
+    .[$n] as $o
+    | ([$o.make, $o.model] | map(select(. != null and . != "")) | join(" ")) as $model
+    | ($o.logical // null) as $l
+    | if $l == null then
+        "\($n) — \($model)\nStatus: off"
+      else
+        (if $o.current_mode != null then $o.modes[$o.current_mode] else null end) as $m
+        | "\($n) — \($model)\n" +
+          "\($l.width)x\($l.height)\(if $m != null then " @ \((($m.refresh_rate / 1000) | round)) Hz" else "" end)" +
+          "  •  position \($l.x),\($l.y)" +
+          "  •  scale \($l.scale)" +
+          "  •  \($l.transform)" +
+          (if $o.vrr_supported then "  •  VRR \(if $o.vrr_enabled then "on" else "off" end)" else "" end)
+      end
+  '
+}
+
+# Bounding box of every active output except the selected one.
+layout_bounds() {
+  local target="$1"
+  niri msg --json outputs | jq -r --arg t "$target" '
+    [to_entries[]
+     | select(.key != $t and .value.logical != null)
+     | .value.logical]
+    | if length == 0 then empty
+      else "\(map(.x) | min) \(map(.y) | min) \(map(.x + .width) | max) \(map(.y + .height) | max)"
+      end
+  '
+}
+
+# Best-effort detection of the current arrangement, used for the "(current)" tag.
+current_layout_key() {
+  local target="$1"
+
+  if [[ "$(output_enabled "$target")" != "true" ]]; then
+    echo "off"
+    return 0
+  fi
+
+  if mirror_active; then
+    local pid m_target m_source
+    read -r pid m_target m_source < "$MIRROR_STATE" || true
+    if [[ "${m_target:-}" == "$target" ]]; then
+      echo "mirror"
+      return 0
+    fi
+  fi
+
+  local enabled_count
+  enabled_count=$(niri msg --json outputs | jq '[.[] | select(.logical != null)] | length') || return 0
+  if [[ "$enabled_count" == "1" ]]; then
+    echo "only"
+    return 0
+  fi
+
+  local rect bounds
+  rect=$(output_rect "$target") || return 0
+  bounds=$(layout_bounds "$target") || return 0
+  if [[ -z "$bounds" ]]; then
+    return 0
+  fi
+
+  local t_x t_y t_w t_h min_x min_y max_x max_y
+  read -r t_x t_y t_w t_h <<< "$rect"
+  read -r min_x min_y max_x max_y <<< "$bounds"
+
+  if (( t_x >= max_x )); then
+    echo "right"
+  elif (( t_x + t_w <= min_x )); then
+    echo "left"
+  elif (( t_y + t_h <= min_y )); then
+    echo "above"
+  elif (( t_y >= max_y )); then
+    echo "below"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Mutating Helpers
+# ------------------------------------------------------------------------------
+run_output() {
+  local name="$1"
+  shift
+  local err
+  if ! err=$(niri msg output "$name" "$@" 2>&1); then
+    error_box "Could not change $name" "${err:-Unknown niri error}"
+    return 1
+  fi
+  return 0
+}
+
+wait_output_on() {
+  local name="$1"
+  local i
+  for i in {1..30}; do
+    if [[ "$(output_enabled "$name")" == "true" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+ensure_output_on() {
+  local name="$1"
+  if [[ "$(output_enabled "$name")" == "true" ]]; then
+    return 0
+  fi
+
+  run_output "$name" on || return 1
+  if ! wait_output_on "$name"; then
+    error_box "Display did not turn on" "$name did not become active."
+    return 1
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# Mirroring (wl-mirror)
+# ------------------------------------------------------------------------------
+mirror_active() {
+  [[ -f "$MIRROR_STATE" ]] || return 1
+
+  local pid target source
+  read -r pid target source < "$MIRROR_STATE" || return 1
+  [[ -n "${pid:-}" ]] || return 1
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$MIRROR_STATE"
+    return 1
+  fi
+
+  if ! tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'wl-mirror'; then
+    rm -f "$MIRROR_STATE"
+    return 1
+  fi
+
+  return 0
+}
+
+stop_mirror() {
+  if ! mirror_active; then
+    rm -f "$MIRROR_STATE"
+    return 0
+  fi
+
+  local pid target source i
+  read -r pid target source < "$MIRROR_STATE" || true
+  kill "$pid" 2>/dev/null || true
+
+  for i in {1..20}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.05
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+
+  rm -f "$MIRROR_STATE"
+}
+
+mirror_involves_output() {
+  local name="$1"
+  mirror_active || return 1
+
+  local pid target source
+  read -r pid target source < "$MIRROR_STATE" || return 1
+  [[ "$name" == "$target" || "$name" == "$source" ]]
+}
+
+find_menu_window_id() {
+  local id=""
+  local i
+
+  # The window may map a few milliseconds after the terminal starts.
+  for i in {1..10}; do
+    id=$(niri msg --json windows 2>/dev/null \
+      | jq -r '[.[] | select(.app_id == "display-manager")] | sort_by(.is_focused | not) | .[0].id // empty' 2>/dev/null \
+      || true)
+    if [[ -n "$id" ]]; then
+      echo "$id"
+      return 0
+    fi
+    sleep 0.05
+  done
+
+  return 1
+}
+
+menu_output() {
+  local id ws_id
+  id=$(find_menu_window_id) || return 1
+
+  ws_id=$(niri msg --json windows 2>/dev/null \
+    | jq -r --argjson id "$id" '.[] | select(.id == $id) | .workspace_id // empty' 2>/dev/null \
+    || true)
+  [[ -n "$ws_id" ]] || return 1
+
+  niri msg --json workspaces 2>/dev/null \
+    | jq -r --argjson id "$ws_id" '.[] | select(.id == $id) | .output // empty' 2>/dev/null
+}
+
+# Move this TUI's own floating window without touching other focused windows.
+move_menu_to_output() {
+  local output="$1"
+  local id
+
+  id=$(find_menu_window_id) || return 0
+  niri msg action move-window-to-monitor --id "$id" "$output" &>/dev/null || true
+}
+
+focus_menu_window() {
+  local id
+  id=$(find_menu_window_id) || return 0
+  niri msg action focus-window --id "$id" &>/dev/null || true
+}
+
+ensure_menu_visible() {
+  mirror_active || return 0
+
+  local pid target source
+  read -r pid target source < "$MIRROR_STATE" || return 0
+
+  # A fullscreen wl-mirror window covers the menu on the mirrored output.
+  local current
+  current=$(menu_output || true)
+  if [[ -z "$current" ]]; then
+    current=$(niri msg --json focused-output 2>/dev/null | jq -r '.name // empty' 2>/dev/null || true)
+  fi
+
+  if [[ -n "$current" && "$current" == "$target" ]]; then
+    move_menu_to_output "$source"
+    focus_menu_window
+  fi
+}
+
+start_mirror() {
+  local source="$1"
+  local target="$2"
+
+  if ! command -v wl-mirror &>/dev/null; then
+    clear
+    gum style --foreground "$DANGER_COLOR" --bold "Mirroring requires wl-mirror."
+    gum style "It is available in the Arch extra repository."
+    echo ""
+    if ! gum confirm "Install wl-mirror with pacman now?"; then
+      return 1
+    fi
+    clear
+    if ! sudo pacman -S --needed wl-mirror; then
+      error_box "Installation failed" "Could not install wl-mirror."
+      return 1
+    fi
+  fi
+
+  if [[ "$source" == "$target" ]]; then
+    error_box "Invalid mirror target" "Source and target displays must be different."
+    return 1
+  fi
+
+  if ! ensure_output_on "$target"; then
+    return 1
+  fi
+  if ! ensure_output_on "$source"; then
+    return 1
+  fi
+
+  stop_mirror
+
+  # Keep the menu readable: move this terminal to the source output before the
+  # fullscreen mirror opens on the target output.
+  move_menu_to_output "$source"
+
+  local pid
+  nohup wl-mirror --fullscreen --fullscreen-output "$target" "$source" </dev/null &>/dev/null &
+  pid=$!
+
+  sleep 0.7
+  if ! kill -0 "$pid" 2>/dev/null; then
+    error_box "wl-mirror exited unexpectedly." "Check that niri supports screen capture."
+    return 1
+  fi
+
+  # wl-mirror may take focus on the target output; bring the menu back.
+  focus_menu_window
+
+  printf '%s\t%s\t%s\n' "$pid" "$target" "$source" > "$MIRROR_STATE"
+  success_box "Mirroring $source onto $target." "Stop it from the display menu (Super+P)."
+}
+
+# ------------------------------------------------------------------------------
+# Arrangement Actions
+# ------------------------------------------------------------------------------
+choose_anchor() {
+  local target="$1"
+  local -a others=()
+  local name
+
+  while IFS= read -r name; do
+    [[ "$name" == "$target" ]] && continue
+    others+=("${name}"$'\t'"$(output_label "$name")")
+  done < <(list_all_outputs)
+
+  if (( ${#others[@]} == 0 )); then
+    error_box "No second display" "Connect another HDMI/DP display to extend to."
+    return 1
+  fi
+
+  if (( ${#others[@]} == 1 )); then
+    cut -f1 <<< "${others[0]}"
+    return 0
+  fi
+
+  local choice
+  choice=$(printf '%s\n' "${others[@]}" | menu_select "Extend from > " "[W/S or ↑/↓]: Move | [ENTER]: Select | [ESC]: Back" "50%" || true)
+  if [[ -z "$choice" ]]; then
+    return 1
+  fi
+  cut -f1 <<< "$choice"
+}
+
+apply_extend() {
+  local target="$1"
+  local anchor="$2"
+  local direction="$3"
+
+  ensure_output_on "$target" || return 1
+  ensure_output_on "$anchor" || return 1
+  sleep 0.2
+
+  local target_rect bounds
+  target_rect=$(output_rect "$target") || return 1
+  bounds=$(layout_bounds "$target") || return 1
+
+  local t_x t_y t_w t_h
+  read -r t_x t_y t_w t_h <<< "$target_rect"
+
+  if [[ -z "$bounds" ]]; then
+    run_output "$target" position set 0 0
+    return $?
+  fi
+
+  local min_x min_y max_x max_y a_x a_y a_w a_h
+  read -r min_x min_y max_x max_y <<< "$bounds"
+  read -r a_x a_y a_w a_h <<< "$(output_rect "$anchor")"
+
+  local new_x new_y
+  case "$direction" in
+    right)
+      new_x="$max_x"
+      new_y="$a_y"
+      ;;
+    left)
+      new_x=$((min_x - t_w))
+      new_y="$a_y"
+      ;;
+    above)
+      new_x="$a_x"
+      new_y=$((min_y - t_h))
+      ;;
+    below)
+      new_x="$a_x"
+      new_y="$max_y"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  run_output "$target" position set "$new_x" "$new_y"
+}
+
+extend_flow() {
+  local target="$1"
+  local direction="$2"
+  local anchor
+
+  anchor=$(choose_anchor "$target") || return 1
+  if [[ -z "$anchor" ]]; then
+    return 1
+  fi
+
+  if mirror_involves_output "$target" || mirror_involves_output "$anchor"; then
+    stop_mirror
+  fi
+
+  if apply_extend "$target" "$anchor" "$direction"; then
+    success_box "Extended $target to the $direction of $anchor."
+  fi
+}
+
+apply_only() {
+  local target="$1"
+  local name
+
+  ensure_output_on "$target" || return 1
+
+  while IFS= read -r name; do
+    [[ "$name" == "$target" ]] && continue
+    if [[ "$(output_enabled "$name")" == "true" ]]; then
+      run_output "$name" off || return 1
+    fi
+  done < <(list_all_outputs)
+
+  run_output "$target" position set 0 0
+}
+
+only_flow() {
+  local target="$1"
+
+  if mirror_active; then
+    stop_mirror
+  fi
+
+  if apply_only "$target"; then
+    success_box "Using only $target now."
+  fi
+}
+
+turn_off_flow() {
+  local target="$1"
+
+  if [[ "$(output_enabled "$target")" != "true" ]]; then
+    success_box "$target is already off."
+    return 0
+  fi
+
+  local enabled_count
+  enabled_count=$(niri msg --json outputs | jq '[.[] | select(.logical != null)] | length') || return 1
+  if (( enabled_count <= 1 )); then
+    error_box "Cannot turn off the last active display." "Keep at least one display on."
+    return 1
+  fi
+
+  if mirror_involves_output "$target"; then
+    stop_mirror
+  fi
+
+  if run_output "$target" off; then
+    success_box "Turned off $target."
+  fi
+}
+
+choose_mirror_source() {
+  local target="$1"
+  local -a sources=()
+  local name
+
+  while IFS= read -r name; do
+    [[ "$name" == "$target" ]] && continue
+    sources+=("${name}"$'\t'"$(output_label "$name")")
+  done < <(list_all_outputs)
+
+  if (( ${#sources[@]} == 0 )); then
+    error_box "No source display" "Connect another display to mirror from."
+    return 1
+  fi
+
+  if (( ${#sources[@]} == 1 )); then
+    cut -f1 <<< "${sources[0]}"
+    return 0
+  fi
+
+  local choice
+  choice=$(printf '%s\n' "${sources[@]}" | menu_select "Mirror from > " "[W/S or ↑/↓]: Move | [ENTER]: Select | [ESC]: Back" "50%" || true)
+  if [[ -z "$choice" ]]; then
+    return 1
+  fi
+  cut -f1 <<< "$choice"
+}
+
+mirror_flow() {
+  local target="$1"
+  local source
+
+  source=$(choose_mirror_source "$target") || return 1
+  if [[ -z "$source" ]]; then
+    return 1
+  fi
+
+  start_mirror "$source" "$target"
+}
+
+# ------------------------------------------------------------------------------
+# Display Settings
+# ------------------------------------------------------------------------------
+list_modes() {
+  local target="$1"
+  niri msg --json outputs | jq -r --arg n "$target" '
+    .[$n] as $o
+    | $o.modes
+    | to_entries
+    | sort_by([
+        (if .key == $o.current_mode then 0 else 1 end),
+        -(.value.width * .value.height),
+        -(.value.refresh_rate)
+      ])
+    | .[]
+    | [.key, .value.width, .value.height, .value.refresh_rate,
+       (if .key == $o.current_mode then 1 else 0 end),
+       (if .value.is_preferred then 1 else 0 end)]
+    | @tsv
+  '
+}
+
+choose_resolution() {
+  local target="$1"
+  local -a items=()
+  local idx w h r current preferred hz label
+
+  while IFS=$'\t' read -r idx w h r current preferred; do
+    [[ -z "${idx:-}" ]] && continue
+    printf -v hz '%d.%03d' $((r / 1000)) $((r % 1000))
+    label="  ${w}x${h}  @ ${hz} Hz"
+    if (( current == 1 )); then
+      label+="  •  current"
+    fi
+    if (( preferred == 1 )); then
+      label+="  •  preferred"
+    fi
+    items+=("${w}x${h}@${hz}"$'\t'"$label")
+  done < <(list_modes "$target" | awk -F'\t' '!seen[$2 FS $3 FS $4]++')
+
+  if (( ${#items[@]} == 0 )); then
+    error_box "No modes found" "Niri did not report any modes for $target."
+    return 1
+  fi
+
+  local choice
+  choice=$(printf '%s\n' "${items[@]}" | menu_select "Resolution > " "[Type]: Search | [Ctrl+W/S]: Move | [ENTER]: Apply | [ESC]: Back" "65%" "$SEARCH_NAV_BINDS" || true)
+  if [[ -z "$choice" ]]; then
+    return 0
+  fi
+
+  local mode
+  mode=$(cut -f1 <<< "$choice")
+  if run_output "$target" mode "$mode"; then
+    success_box "Set $target to $mode."
+  fi
+}
+
+choose_rotation() {
+  local target="$1"
+  local current current_key=""
+  current=$(niri msg --json outputs | jq -r --arg n "$target" '.[$n].logical.transform // "Normal"')
+
+  case "$current" in
+    Normal) current_key="normal" ;;
+    90) current_key="90" ;;
+    180) current_key="180" ;;
+    270) current_key="270" ;;
+    Flipped) current_key="flipped" ;;
+    Flipped90|Flipped-90) current_key="flipped-90" ;;
+    Flipped180|Flipped-180) current_key="flipped-180" ;;
+    Flipped270|Flipped-270) current_key="flipped-270" ;;
+  esac
+
+  local -a items=(
+    "normal"$'\t'"Normal (0°)"
+    "90"$'\t'"90° counter-clockwise"
+    "180"$'\t'"180°"
+    "270"$'\t'"270° counter-clockwise"
+    "flipped"$'\t'"Flipped horizontally"
+    "flipped-90"$'\t'"90° + flipped horizontally"
+    "flipped-180"$'\t'"Flipped vertically"
+    "flipped-270"$'\t'"270° + flipped horizontally"
+  )
+
+  local i key label updated=()
+  for i in "${items[@]}"; do
+    key=$(cut -f1 <<< "$i")
+    label=$(cut -f2- <<< "$i")
+    if [[ "$key" == "$current_key" ]]; then
+      label+="  •  current"
+    fi
+    updated+=("${key}"$'\t'"${label}")
+  done
+
+  local choice
+  choice=$(printf '%s\n' "${updated[@]}" | menu_select "Rotation > " "[W/S or ↑/↓]: Move | [ENTER]: Apply | [ESC]: Back" "55%" || true)
+  if [[ -z "$choice" ]]; then
+    return 0
+  fi
+
+  local transform
+  transform=$(cut -f1 <<< "$choice")
+  if run_output "$target" transform "$transform"; then
+    success_box "Rotated $target ($transform)."
+  fi
+}
+
+choose_scale() {
+  local target="$1"
+  local current
+  current=$(niri msg --json outputs | jq -r --arg n "$target" '
+    .[$n].logical.scale // "auto"
+    | if type == "number" then (.*100 | round / 100 | tostring) else . end
+  ')
+
+  local -a items=(
+    "auto"$'\t'"Automatic"
+    "1"$'\t'"100% (1.0)"
+    "1.25"$'\t'"125% (1.25)"
+    "1.5"$'\t'"150% (1.5)"
+    "1.75"$'\t'"175% (1.75)"
+    "2"$'\t'"200% (2.0)"
+    "custom"$'\t'"Custom value…"
+  )
+
+  local i key label updated=()
+  for i in "${items[@]}"; do
+    key=$(cut -f1 <<< "$i")
+    label=$(cut -f2- <<< "$i")
+    if [[ "$key" == "$current" ]]; then
+      label+="  •  current"
+    fi
+    updated+=("${key}"$'\t'"${label}")
+  done
+
+  local choice
+  choice=$(printf '%s\n' "${updated[@]}" | menu_select "Scale > " "[W/S or ↑/↓]: Move | [ENTER]: Select | [ESC]: Back" "55%" || true)
+  if [[ -z "$choice" ]]; then
+    return 0
+  fi
+
+  local scale
+  scale=$(cut -f1 <<< "$choice")
+  if [[ "$scale" == "custom" ]]; then
+    scale=$(gum input --prompt "Scale factor > " --placeholder "e.g., 1.25" || true)
+    if [[ -z "$scale" ]]; then
+      return 0
+    fi
+    if [[ ! "$scale" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      error_box "Invalid scale" "Enter a number such as 1, 1.25 or 2."
+      return 1
+    fi
+  fi
+
+  if run_output "$target" scale "$scale"; then
+    success_box "Set scale to $scale on $target."
+  fi
+}
+
+toggle_vrr() {
+  local target="$1"
+  local enabled state
+
+  enabled=$(niri msg --json outputs | jq -r --arg n "$target" '.[$n].vrr_enabled // false')
+  if [[ "$enabled" == "true" ]]; then
+    state="off"
+  else
+    state="on"
+  fi
+
+  if run_output "$target" vrr "$state"; then
+    success_box "Turned VRR $state on $target."
+  fi
+}
+
+settings_menu() {
+  local target="$1"
+
+  while true; do
+    clear
+    banner
+
+    local summary
+    summary=$(output_summary "$target") || return 1
+
+    gum style --foreground "$HEADER_COLOR" --bold "Display settings"
+    gum style \
+      --border rounded \
+      --border-foreground "$BORDER_COLOR" \
+      --padding "0 1" \
+      "$summary"
+    echo ""
+
+    local vrr_supported
+    vrr_supported=$(niri msg --json outputs | jq -r --arg n "$target" '.[$n].vrr_supported // false') || vrr_supported=false
+
+    local -a items=(
+      "__resolution__"$'\t'"▤  Resolution & refresh rate"
+      "__rotate__"$'\t'"⟳  Rotation"
+      "__scale__"$'\t'"⤢  Scale"
+    )
+
+    if [[ "$vrr_supported" == "true" ]]; then
+      local vrr_enabled
+      vrr_enabled=$(niri msg --json outputs | jq -r --arg n "$target" '.[$n].vrr_enabled // false') || vrr_enabled=false
+      if [[ "$vrr_enabled" == "true" ]]; then
+        items+=("__vrr__"$'\t'"󰒓  Disable variable refresh rate (currently on)")
+      else
+        items+=("__vrr__"$'\t'"󰒓  Enable variable refresh rate (currently off)")
+      fi
+    fi
+
+    items+=("__reset_position__"$'\t'"⌖  Reset position (auto)")
+    items+=("__back__"$'\t'"󰌍  Back to display modes")
+
+    local choice
+    choice=$(printf '%s\n' "${items[@]}" | menu_select "Settings > " "[W/S or ↑/↓]: Move | [ENTER]: Select | [ESC]: Back" "55%" || true)
+    if [[ -z "$choice" ]]; then
+      return 0
+    fi
+
+    local key
+    key=$(cut -f1 <<< "$choice")
+    case "$key" in
+      "__resolution__")
+        choose_resolution "$target"
+        ;;
+      "__rotate__")
+        choose_rotation "$target"
+        ;;
+      "__scale__")
+        choose_scale "$target"
+        ;;
+      "__vrr__")
+        toggle_vrr "$target"
+        ;;
+      "__reset_position__")
+        if run_output "$target" position auto; then
+          success_box "Reset $target to automatic positioning."
+        fi
+        ;;
+      "__back__")
+        return 0
+        ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------------------------
+# Mode Menu (one selected display)
+# ------------------------------------------------------------------------------
+mode_menu() {
+  local target="$1"
+
+  while true; do
+    clear
+    banner
+
+    local summary
+    summary=$(output_summary "$target") || return 1
+
+    gum style --foreground "$HEADER_COLOR" --bold "Selected display"
+    gum style \
+      --border rounded \
+      --border-foreground "$BORDER_COLOR" \
+      --padding "0 1" \
+      "$summary"
+    echo ""
+
+    local hint
+    hint=$(current_layout_key "$target") || hint=""
+    local m_right="" m_left="" m_above="" m_below="" m_mirror="" m_only=""
+    case "$hint" in
+      right) m_right="  •  current" ;;
+      left) m_left="  •  current" ;;
+      above) m_above="  •  current" ;;
+      below) m_below="  •  current" ;;
+      mirror) m_mirror="  •  current" ;;
+      only) m_only="  •  current" ;;
+    esac
+
+    local -a items=()
+
+    if [[ "$(output_enabled "$target")" != "true" ]]; then
+      items+=("__on__"$'\t'"󰐥  Turn on this display")
+    fi
+
+    items+=(
+      "__mirror__"$'\t'"⧉  Mirror another display (duplicate)${m_mirror}"
+      "__extend_right__"$'\t'"󰁔  Extend to the right${m_right}"
+      "__extend_left__"$'\t'"󰁍  Extend to the left${m_left}"
+      "__extend_above__"$'\t'"󰁝  Extend above${m_above}"
+      "__extend_below__"$'\t'"󰁅  Extend below${m_below}"
+      "__only__"$'\t'"󰍹  Use only this display (second screen only)${m_only}"
+      "__settings__"$'\t'"󰒓  Display settings (resolution, rotation, scale)"
+    )
+
+    if [[ "$(output_enabled "$target")" == "true" ]]; then
+      items+=("__off__"$'\t'"󰐥  Turn off this display (PC screen only)")
+    fi
+
+    items+=(
+      "__back__"$'\t'"󰌍  Back to display selection"
+      "__quit__"$'\t'"󰈆  Quit"
+    )
+
+    local choice
+    choice=$(printf '%s\n' "${items[@]}" | menu_select "Mode > " "[W/S or ↑/↓]: Move | [ENTER]: Select | [ESC]: Back" "55%" || true)
+    if [[ -z "$choice" ]]; then
+      return 0
+    fi
+
+    local key
+    key=$(cut -f1 <<< "$choice")
+    case "$key" in
+      "__on__")
+        if ensure_output_on "$target"; then
+          success_box "Turned on $target."
+        fi
+        ;;
+      "__off__")
+        turn_off_flow "$target"
+        ;;
+      "__extend_right__")
+        extend_flow "$target" "right"
+        ;;
+      "__extend_left__")
+        extend_flow "$target" "left"
+        ;;
+      "__extend_above__")
+        extend_flow "$target" "above"
+        ;;
+      "__extend_below__")
+        extend_flow "$target" "below"
+        ;;
+      "__mirror__")
+        mirror_flow "$target"
+        ;;
+      "__only__")
+        only_flow "$target"
+        ;;
+      "__settings__")
+        settings_menu "$target"
+        ;;
+      "__back__")
+        return 0
+        ;;
+      "__quit__")
+        clear
+        exit 0
+        ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------------------------
+# Main Menu Loop
+# ------------------------------------------------------------------------------
+main() {
+  require_commands
+  ensure_menu_visible
+
+  while true; do
+    banner
+
+    local -a items=()
+    local name
+
+    while IFS= read -r name; do
+      items+=("${name}"$'\t'"$(output_label "$name")")
+    done < <(list_external_outputs)
+
+    if (( ${#items[@]} == 0 )) && ! mirror_active; then
+      gum style --foreground "$DANGER_COLOR" --bold "No HDMI/DP display detected."
+      gum style "Connect a monitor or projector, then open this menu again."
+      echo ""
+      read -n 1 -s -r -p "Press any key to continue..."
+      clear
+      exit 0
+    fi
+
+    if mirror_active; then
+      local pid m_target m_source
+      read -r pid m_target m_source < "$MIRROR_STATE" || true
+      items+=("__stop_mirror__"$'\t'"⧉  Stop mirroring (${m_target:-?} ← ${m_source:-?})")
+    fi
+
+    items+=("__quit__"$'\t'"󰈆  Quit")
+
+    gum style --foreground "$BORDER_COLOR" "Choose an HDMI/DisplayPort display to configure:"
+    echo ""
+
+    local choice
+    choice=$(printf '%s\n' "${items[@]}" | menu_select "Display > " "[W/S or ↑/↓]: Move | [ENTER]: Select | [ESC]: Quit" "55%" || true)
+    if [[ -z "$choice" ]]; then
+      clear
+      exit 0
+    fi
+
+    local key
+    key=$(cut -f1 <<< "$choice")
+    case "$key" in
+      "__stop_mirror__")
+        stop_mirror
+        success_box "Mirroring stopped."
+        ;;
+      "__quit__")
+        clear
+        exit 0
+        ;;
+      *)
+        if [[ -n "$key" ]]; then
+          mode_menu "$key"
+        fi
+        ;;
+    esac
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
